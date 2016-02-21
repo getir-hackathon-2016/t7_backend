@@ -1,7 +1,9 @@
 var express = require('express');
 var app = express();
 var assert = require('assert');
+var socket = require('socket.io');
 var async = require("async");
+ObjectID = require('mongodb').ObjectID;
 URL = require('url'),
 qs = require('querystring')
 
@@ -9,12 +11,12 @@ var mongoClient = require('mongodb').MongoClient;
 
 var MONGODB_URI = "mongodb://admin:123456@ds011278.mongolab.com:11278/heroku_hs6w48x7";
 
-var storeID;
+var orders = [];
 
 // This responds with "Hello World" on the homepage
 app.get('/', function (request, response) {
 	console.log("Got a GET request for the homepage");
-	response.send('Hello Getir-Hackathon');
+	response.sendFile(__dirname + "/index.html");
 })
 
 app.get('/login', function(request, response){
@@ -34,15 +36,16 @@ app.get('/login', function(request, response){
 
 var checkUser = function(db, response, userName, userPass) {
 
-	var login = db.collection('users').findOne( {"id": userName, "pass": userPass});
-	if(login){
-		var message = "Welcome " + userName;
-		var json = {"message": message};
-		response.send(JSON.stringify(json));
-	} else {
-		var json = {"message":"Please register"};
-		response.send(JSON.stringify(json));
-	}
+	db.collection('users').findOne( {"id": userName, "pass": userPass}, function (err, doc) {
+		assert.equal(err, null);
+		if(doc != null){
+			var json = {"token": login.token};
+			response.send(JSON.stringify(json));
+		} else{
+			var json = {"message":"Please register"};
+			response.send(JSON.stringify(json));
+		}
+	});
 
 };
 
@@ -51,7 +54,8 @@ app.get('/signup', function(request, response){
 	var url_params = URL.parse(request.url, true);
 	var user_name = url_params.query.name;
 	var user_password = url_params.query.password;
-	console.log("User name = " + user_name + ", password is " + user_password);
+	var token = require('crypto').createHash('md5').update("getir" + user_name + "md" + user_password + "hackathon").digest("hex");
+	console.log("User name = " + user_name + ", password is " + user_password + " token: " + token);
 
 	mongoClient.connect(MONGODB_URI, function(err, db) {
 		if (err) throw err;
@@ -59,15 +63,16 @@ app.get('/signup', function(request, response){
 		insertUser(db, function(message){
 			response.end(message);
 			db.close();
-		}, user_name, user_password);
+		}, user_name, user_password, token);
 	});
 
 })
 
-var insertUser = function(db, callback, userName, userPass){
+var insertUser = function(db, callback, userName, userPass, token){
 	db.collection('users').insertOne({
 		"id" : userName,
-		"pass" : userPass
+		"pass" : userPass,
+		"token" : token
 	}), function(err, result){
 		if(err){
 			console.log("error insert:" + err);
@@ -75,31 +80,6 @@ var insertUser = function(db, callback, userName, userPass){
 			console.log("Inserted a document into the restaurants collection.");
 			callback("Inserted a document into the restaurants collection" + userName);
 		}
-	}
-}
-
-app.get('/order', function(request, response){
-	var url_params = URL.parse(request.url, true);
-	var store_id = url_params.query.store_id;
-	var product_id = url_params.query.product_id;
-	var order_count = url_params.query.order_count;
-
-	mongoClient.connect(MONGODB_URI, function(err, db) {
-		if (err) throw err;
-		console.log("Connected to Database");
-		checkStock(db, response, store_id, product_id, order_count);
-	});
-})
-
-var checkStock = function(db, response, store_id, product_id, order_count){
-	var stockExist = db.collection('stocks').findOne( {"store_id": store_id, "product_id": product_id, "stocks": {$gt: order_count}} );
-	if(stockExist){
-		var message = "Sana " + order_count + " tane " + product_id + " göndereceğim";
-		var json = { "message" : message};
-		response.send(JSON.stringify(json));
-	} else{
-		var json = {"message" : "Yeterli miktarda ürün yok"};
-		response.send(JSON.stringify(json));
 	}
 }
 
@@ -153,7 +133,8 @@ app.get('/location', function(request, response){
 											})
 										}
 										, function(){
-											response.end(JSON.stringify(results));
+											var send = {"products": results, "store_id": storeID};
+											response.end(JSON.stringify(send));
 										})
 								}
 							}
@@ -168,9 +149,6 @@ app.get('/location', function(request, response){
 	});
 
 });
-
-
-
 function getDistanceFromLatLonInKm(lat1,lon1,lat2,lon2) {
 	var R = 6371; // Radius of the earth in km
 	var dLat = deg2rad(lat2-lat1);  // deg2rad below
@@ -184,7 +162,6 @@ function getDistanceFromLatLonInKm(lat1,lon1,lat2,lon2) {
 	var d = R * c; // Distance in km
 	return d;
 }
-
 function deg2rad(deg) {
 	return deg * (Math.PI/180)
 }
@@ -268,7 +245,7 @@ app.get('/json', function(request, response){
 	response.end(JSON.stringify(jsonArray));
 })
 
-var server = app.listen(process.env.PORT || 8081, function () {
+var server = app.listen(process.env.PORT || 8082, function () {
 
   var host = server.address().address
   var port = server.address().port
@@ -276,3 +253,189 @@ var server = app.listen(process.env.PORT || 8081, function () {
   console.log("Example app listening at http://%s:%s", host, port)
 
 })
+
+var io = socket.listen(server);
+
+var checkStock = function(info, callback){
+
+	mongoClient.connect(MONGODB_URI, function(err, db) {
+		if (err) throw err;
+		console.log("Connected to Database");
+
+		db.collection('stocks').findOne({
+			"store_id": info.store_id,
+			"product_id": info.product_id,
+			"stocks": {$gt: info.order_count}
+		}, function (err, doc) {
+			assert.equal(err, null);
+			if (doc != null) {
+				var json = {"success": true,
+					"store_id": info.store_id,
+					"product_id": info.product_id,
+					"order_count": info.order_count};
+				console.log("js: " + json.success);
+				callback(JSON.stringify(json));
+				//callback(json);
+			} else {
+				var json = {"success": false,
+					"store_id": info.store_id,
+					"product_id": info.product_id,
+					"order_count": info.order_count};
+				//callback(json);
+				callback(JSON.stringify(jon));
+			}
+		});
+	});
+}
+
+var updateStock = function(info, operator, callback){
+	mongoClient.connect(MONGODB_URI, function(err, db) {
+		if (err) throw err;
+		console.log("Connected to Database");
+
+		if(operator === '-'){
+			var st;
+			db.collection('stocks').findOne( {"store_id": info.store_id, "product_id": info.product_id}, function (err, doc) {
+				assert.equal(err, null);
+				st = doc.stocks;
+				console.log("st: " + st);
+				db.collection('stocks').updateOne({
+					"store_id": info.store_id,
+					"product_id": info.product_id
+				},{
+					$set: {
+						"stocks": st - info.order_count
+					}
+				}, function(err, doc){
+					assert.equal(err, null);
+					var json = {"success": true,
+						"store_id": info.store_id,
+						"product_id": info.product_id,
+						"order_count": info.order_count};
+					callback(json);
+					//callback(JSON.stringify(json));
+				});
+
+			});
+
+
+		} else if(operator === '+'){
+			var st;
+			db.collection('stocks').findOne( {"store_id": info.store_id, "product_id": info.product_id}, function (err, doc) {
+				assert.equal(err, null);
+				st = doc.stocks;
+
+				db.collection('stocks').updateOne({
+					"store_id": info.store_id,
+					"product_id": info.product_id
+				},{
+					$set: {
+						"stocks": st + info.order_count
+					}
+				}, function(err, doc){
+					assert.equal(err, null);
+					var json = {"success": true,
+						"store_id": info.store_id,
+						"product_id": info.product_id,
+						"order_count": info.order_count};
+					callback(JSON.stringify(json));
+				});
+
+			});
+
+
+		}
+
+	});
+}
+
+var handleClient = function (socket) {
+	console.log("client connected: " + socket.id);
+
+	//send a message to the client.
+	socket.emit('message', 'You are connected!');
+
+	// When the server receives a “order” type signal from the client
+	socket.on('order', function (message) {
+
+		socket.emit('message', 'You can send me a message. I can see! token: ' + message.toString());
+
+		var date = new Date();
+		var milliseconds = date.getTime();
+		message.time = milliseconds;
+
+		var alreadyExist = false;
+		var len = orders.length;
+		for(var i = 0; i < len; i++){
+			if(orders[i].token == message.token && orders[i].product_id == message.product_id && orders[i].store_id == message.store_id){
+				alreadyExist = true;
+				if(orders[i].order_count < message.order_count){
+					var diffObj = {
+						"store_id": message.store_id,
+						"product_id": message.product_id,
+						"order_count": message.order_count - orders[i].order_count
+					}
+					checkStock(diffObj, function (msg) {
+
+						flag = JSON.parse(msg);
+						if(flag.success){
+							orders[i]= message;
+							updateStock(diffObj, function(){
+								socket.emit('status', flag.success);
+							});
+						}
+					})
+				} else{ //if updated order less products
+					var diffObj = {
+						"store_id": orders[i].store_id,
+						"product_id": orders[i].product_id,
+						"order_count": orders[i].order_count - message.order_count
+					}
+
+					updateStock(diffObj, function(){
+						socket.emit('status', {"success": true});
+					});
+
+				}
+			}
+		}
+
+		if(!alreadyExist){
+
+			socket.emit('message', 'kontrol ediliyor');
+			checkStock(message, function (msg) {
+				flag = JSON.parse(msg);
+				console.log("flag : " + flag.success);
+
+				socket.emit('message', 'durum mesaajjı');
+				if(flag.success){
+					orders.push(message);
+					updateStock(message, '-', function(){
+						socket.emit('status', flag.success);
+					});
+				}
+			})
+		}
+
+		socket.on('okey', function(){
+			var date2 = new Date();
+			var milliseconds2 = date2.getTime();
+
+			console.log("time: " + message.time);
+
+			var diff = milliseconds2 - message.time;
+			diff /= 60000;
+			if(diff > 1){
+				updateStock(message, '+', function(){
+					console.log("your session down - too late");
+				});
+			} else{
+				console.log("siparis onaylandi");
+			}
+		})
+
+	});
+
+};
+
+io.sockets.on('connection', handleClient);
